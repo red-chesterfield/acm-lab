@@ -87,6 +87,8 @@ class LabBMCConnection(object):
       self.get_system_resource         = self.connection.get_this_system_resource
       self.get_system_manager_resource = self.connection.get_this_system_manager_resource
 
+      self.update_resource_by_id       = self.connection.update_resource_by_id
+
       self.start_task     = self.connection.start_task
       self.get_task       = self.connection.get_task
       self.perform_action = self.connection.perform_action
@@ -254,6 +256,23 @@ class TaskRunner:
          blurt("Aborting because one or more machines failed verification checks.")
          return
 
+      # Give the tasks a chance to prepare input, or decline to do so, before
+      # we start any real work.
+
+      tasks_are_needed = False
+
+      for machine in list(self.tasks.keys()):
+         task = self.tasks[machine]
+         if task.prepare_task_request():
+            tasks_are_needed = True
+         else:
+            blurt("[%s] No task is necessary for this machine." % machine)
+            del self.tasks[machine]
+      #
+      if not tasks_are_needed:
+         blurt("No tasks are needed.")
+         return
+
       # Perform pre-submit pass, intnedned to get every machine into whatever
       # pre-task-submit state is required if more than power control is needed.
 
@@ -286,19 +305,22 @@ class TaskRunner:
          bmc_conn = task.get_bmc_conn()
 
          try:
-            blurt("   Submitting task on %s." % machine)
-
             task_target = task.get_task_target()
             task_body   = task.get_task_body()
 
-            task_id = bmc_conn.start_task(task_target, task_body)
-            dbg("Task id: %s" % task_id)
-            task.set_task_id(task_id)
-
+            if task_target is None:
+               reason = "No task target set"
+               blurt("[%s] Abaonding further action for machine: %s." % (machine, reason))
+               del self.tasks[machine]
+            else:
+               blurt("   Submitting task on %s." % machine)
+               task_id = bmc_conn.start_task(task_target, task_body)
+               dbg("Task id: %s" % task_id)
+               task.set_task_id(task_id)
          except BMCRequestError as exc:
-            emsg("Request error from %s: %s" % (machine, exc))
+            emsg("[%s] Request error: %s" % (machine, exc))
             reason = "Could not submit %s task" % short_task_name
-            blurt("Abaonding further action for %s: %s." % (machine, reason))
+            blurt("[%s] Abaonding further action for machine: %s." % (machine, reason))
             del self.tasks[machine]
       #
 
@@ -319,8 +341,8 @@ class TaskRunner:
          try:
             pause_after_pass = task.post_submit() or pause_after_pass
          except BMCError as exc:
-            emsg(str(exc))
-            blurt("Abandoning futher action for %s due to preceeding errors." % machine)
+            emsg("[%s] %s" % (machine, str(exc)))
+            blurt("[%s] Abandoning futher action for machine due to preceeding errors." % machine)
             del self.tasks[machine]
       #
       if not self.tasks:
@@ -345,7 +367,7 @@ class TaskRunner:
             try:
                task_res = bmc_conn.get_task(task_id)
                if task_has_ended(task_res):
-                  blurt("Task for system %s has ended." % task.machine)
+                  blurt("[%s] Task for machine has ended." % task.machine)
                   del pending_tasks[machine]
                   task.ending_task_res = task_res ## Should use a setter ##
                else:
@@ -354,17 +376,17 @@ class TaskRunner:
                      # On Dell iDRAC, it seems tasks remaining in Starting while the system is
                      # going through its power-on initialization.  Then the task transitions
                      # to running when LC has control.
-                     blurt("System %s is still starting up." % machine)
+                     blurt("[%s] Machine is still starting up." % machine)
                   else:
                      tasK_pct_complete = task_res["PercentComplete"]
-                     blurt("Task for system %s still in progress: %s (%d%% complete)." %
+                     blurt("[%s] Task still in progress: %s (%d%% complete)." %
                            (machine, task_state, tasK_pct_complete))
 
             except BMCRequestError as exc:
-               emsg("BMC request error from %s: %s" % (machine, exc))
+               emsg("[%s] BMC request error: %s" % (machine, exc))
                del pending_tasks[machine]
                task.ending_task_res = None
-               blurt("Abaonding further action for %s: %s." % (machine, reason))
+               blurt("[%s] Abaonding further action for machine: %s." % (machine, reason))
                del self.tasks[machine]
          #
          if len(pending_tasks) > 0:
@@ -381,12 +403,12 @@ class TaskRunner:
             task_status = task_res["TaskStatus"]
             task_state = task_res["TaskState"]
             if task_status == "OK":
-               blurt("Task %s for %s has comopleted successfully." % (short_task_name, machine))
+               blurt("[%s] Task %s has comopleted successfully." % (machine, short_task_name))
             else:
-               blurt("Task %s for %s has failed.  Ending tatus/state: %s/%s" %
-                     (short_task_name, machine, task_status, task_state))
+               blurt("[%s] Task %s has failed.  Ending tatus/state: %s/%s" %
+                     (machine, short_task_name, task_status, task_state))
          else:
-            blurt("Task %s state for %s is unknown due to previous errors." % (short_task_name, machine))
+            blurt("[%s] Task %s state is unknown due to previous errors." % (machine, short_task_name))
       #
 
       # Perform post-completion pass, intnedned to get every machine into whatever post-
@@ -424,12 +446,22 @@ class RunnableTask:
    def pre_check(self):
       return True
 
+   def prepare_task_request(self):
+      # Give task a chance to defer prep of task target or body until we need it.
+      return True
+
+   def get_task_target(self):
+      return self.task_target
+
+   def get_task_body(self):
+      return None
+
    @classmethod
    def announce_pre_submit_pass(self):
       return
 
    def pre_submit(self):
-      return False  # Didn't do anothing, so no BMC-catch-up pausing needed.
+      return False  # Didn't do anything, so no BMC-catch-up pausing needed.
 
    @classmethod
    def announce_post_submit_pass(self):

@@ -1,0 +1,598 @@
+#!/bin/python3
+
+# Reset the boot sequence on a Fog machine to a standard set.
+#
+# Hopefully does enough queries to verify the target machine is setup
+# as expected before doing the wiping.
+#
+# This is HIGHLY Dell Server and Fog-Machine-Setup specific!
+
+# Author: J. M. Gdaniec, Aug 2021
+
+from lab_common import *
+
+import argparse
+import json
+import time
+import traceback
+
+# Some constatns:
+entry_kind_prop                = "*Kind"
+entry_kind_first_disk          = "first-disk"
+entry_kind_other_disk          = "other-disk"
+entry_kind_first_pxe_boot      = "first-pxe"
+entry_kind_other_pxe_boot      = "other-pxe"
+entry_kind_first_optical_drive = "first-optical-drive"
+entry_kind_other_optical_drive = "other-optical-drive"
+entry_kind_generic_usb         = "generic-usb"
+entry_kind_uefi_os             = "uefi-os"
+
+
+def show_boot_sequence(machine, boot_seq, show_details=True):
+
+   ix = 0
+   for boot_entry in boot_seq:
+      display_name = boot_entry["DisplayName"]
+      enabled = boot_entry["BootOptionEnabled"]
+      uefi_dev_path = boot_entry["UefiDevicePath"]
+      enabled_flag = "*" if enabled else " "
+      details = " [%s]" % uefi_dev_path if show_details else ""
+      dbg("[%s] %s %02d: %s%s" % (machine, enabled_flag, ix, display_name, details))
+      ix += 1
+
+#
+
+def show_dell_boot_sequence(machine, entries, id_to_disp_name_map, show_details=True):
+   for e in entries:
+      ix    = e["Index"]
+      ident = e["Id"]
+      name = e["Name"]
+      enabled = e["Enabled"]
+      display_name = id_to_disp_name_map[ident]
+      enabled_flag = "*" if enabled else " "
+      details = " [%s]" % name if show_details else ""
+      dbg("[%s] %s %02d: %s%s" % (machine, enabled_flag, ix, display_name, details))
+
+
+def classify_dell_boot_entries(machine, boot_seq):
+
+   # Highly Dell and Fog-machine specific!
+
+   # HACK WARNING:
+   # The following code makes lots of dependencies on likely Dell-specific device display
+   # names because there doesn't appear to be any better way to be able to detect the
+   # kind of device being mentioned in a boot entry.  The best alternative would be to
+   # rely on the UEFI device path, but that is probably worse because then it introduces
+   # depednencies on just how the devices are plugged into the PCI device address space.
+
+   # We're prepated to find the following kinds of things in the boot sequence:
+   #
+   # - Disk placeholder entries:
+   #   + Eg: Integrated RAID Controller 1: EFI RAID Disk PlaceHolder 1
+   #   + Recognized by:
+   #     - UEFI device path being of the form PciRoot(...)
+   #     - Display name containing the string "Disk Placeholder"
+   #
+   # - PXE Boot entries:
+   #   + Eg: PXE Device 1: Embedded NIC 1 Port 1 Partition 1
+   #   + Recognized by:
+   #     - UEFI device path being of the form VenHw(...)
+   #     - Display name containing the string "PXE Device"
+   #
+   # - Optical drive entries:
+   #   + Eg: Embedded SATA Port Optical Drive E: EFI DVD/CDROM 1
+   #   + Recognized by:
+   #     - UEFI device path being of the form PciRoot(...)
+   #     - Display name containing the string "Optical Drive"
+   #
+   # - Generic USB boot entries:
+   #   + Eg: Generic USB Boot
+   #   + Recognized by:
+   #     - Display name being equal to string "Generic USB Boot"
+   #
+   # - UEFI ("efitbootmgr managed") OS etnries:
+   #   + Eg display name: Unavailable: Red Hat Enterprise Linux
+   #   + Recognized by:
+   #     - UEFI device path being of the form HD(...)
+
+   # More details on display name stuff We rely on:
+   #
+   # Disk placeholders names:
+   #    Integrated RAID Controller n: <anything> Disk Placeholder n
+   #
+   # PXE boot device names:
+   #    PXE Device n: <specific-device-info>
+   #
+   # Optical drive names:
+   #    <anything> Optical Drive <anything>>: <specific-dev-info> n
+
+   all_entries_recognized = True
+   for e in boot_seq:
+      recognized = False
+      display_name  = e["DisplayName"]
+      uefi_dev_path = e["UefiDevicePath"]
+
+      if uefi_dev_path.startswith("HD("):
+         dbg("Entry is a UEFI OS entry for:  %s." % display_name)
+         e[entry_kind_prop] = entry_kind_uefi_os
+         recognized = True
+
+      elif uefi_dev_path.startswith("PciRoot("):
+
+         if  "Disk PlaceHolder" in display_name:
+            first_raid_controller_prefix = "Integrated RAID Controller 1: "
+            is_first_raid_controller = display_name.startswith(first_raid_controller_prefix)
+            if is_first_raid_controller:
+               disk_placeholder_name = display_name[len(first_raid_controller_prefix):]
+               placeholder_nr = int(disk_placeholder_name[disk_placeholder_name.rfind(" ")+1:])
+               if placeholder_nr == 1:
+                  dbg("Entry is first disk placeholder: %s" % disk_placeholder_name)
+                  e[entry_kind_prop] = entry_kind_first_disk
+               else:
+                  dbg("Entry is additional disk placeholder: %s" % disk_placeholder_name)
+                  e[entry_kind_prop] = entry_kind_other_disk
+               recognized = True
+
+         elif "Optical Drive" in display_name:
+            optical_drive_name = display_name[display_name.rfind(":")+2:]
+            optical_drive_nr = int(optical_drive_name[optical_drive_name.rfind(" ")+1:])
+            if optical_drive_nr == 1:
+               dbg("Entry is first optical drive: %s" % optical_drive_name)
+               e[entry_kind_prop] = entry_kind_first_optical_drive
+            else:
+               dbg("Entry is additional optical drive: %s" % optical_drive_name)
+               e[entry_kind_prop] = entry_kind_other_optical_drive
+            recognized = True
+
+      elif uefi_dev_path.startswith("VenHw("):
+
+         if "PXE Device" in display_name:
+            first_pxe_dev_prefix = "PXE Device 1: "
+            is_first_pxe_device = display_name.startswith(first_pxe_dev_prefix)
+            if is_first_pxe_device:
+               pxe_dev_name = display_name[len(first_pxe_dev_prefix):]
+               dbg("Entry is first PXE boot device: %s" % pxe_dev_name)
+               e[entry_kind_prop] = entry_kind_first_pxe_boot
+            else:
+               pxe_dev_name = display_name[display_name.find(":")+2:]
+               dbg("Entry is additional PXE boot device: %s" % pxe_dev_name)
+               e[entry_kind_prop] = entry_kind_other_pxe_boot
+            recognized = True
+
+         elif display_name == "Generic USB Boot":
+            dbg("Entry is generic boot entry: %s" % display_name)
+            e[entry_kind_prop] = entry_kind_generic_usb
+            recognized = True
+
+      if not recognized:
+         emsg("Unrecognized boot-sequecne entry: %s" % display_name)
+         blurt(json_dumps(e))
+         all_entries_recognized = False
+   #
+
+   if not all_entries_recognized:
+      emsg("[%s] One or more boot-sequence entries not recognized." % machine)
+
+   return all_entries_recognized
+
+def rearrange_boot_sequence(machine, input_boot_seq):
+
+   # Highly Fog-machine specific!
+
+   # We're prepated to find the following kinds of things in the boot sequence:
+   #
+   # - entry_kind_first_disk/entry_kind_other_disk:
+   #   + Disposition:
+   #     - The first such disk entry becomes the first entry in the new boot sequence.
+   #        Its the only one marked enabled.
+   #     - Other disk entries found are pushed down below all of the "first of" entries
+   #       and are marked disabled.
+   #
+   # - entry_kind_first_pxe_boot/entry_kind_other_pxe_boot:
+   #   + Disposition:
+   #     - The first such entry becomes the second entry in the new boot sequence.
+   #       It is marked disabled.
+   #     - Other entries found are pushed down below all of the "first of" entries
+   #       and are marked disabled.
+   #
+   # - entry_kind_first_optical_drive/entry_kind_other_optical_drive:
+   #   + Disposition:
+   #     - The first such entry becomes the third entry in the new boot sequence.
+   #       It is marked disabled.
+   #     - Other entries found are pushed down below all of the "first of" entries
+   #       and are marked disabled.
+   #
+   # - entry_kind_generic_usb:
+   #   + Disposition:
+   #     - Considered to be of a generic "other" type
+   #     - All such entries found are pushed down below all of the "first of" entries
+   #       and are marked disabled.
+   #
+   # - entry_kind_uefi_os:
+   #   + Disposition:
+   #     - All such entries found are pushed down to be the last group of entries in
+   #       the new boot sequence, and are marked disabled.
+
+   # Gather up what we have based on kind.
+
+   first_disk_entry = None
+   other_disk_entries = []
+   first_pxe_boot_entry = None
+   other_pxe_boot_entries = []
+   first_optical_drive_entry = None
+   other_optical_drive_entries = []
+   uefi_os_entries = []
+   other_entries = []
+
+   all_entries_recognized = True
+   for e in input_boot_seq:
+      kind = e[entry_kind_prop]
+
+      if kind == entry_kind_first_disk:
+         first_disk_entry = e
+      elif kind == entry_kind_other_disk:
+         other_disk_entries.append(e)
+      elif kind == entry_kind_first_pxe_boot:
+         first_pxe_boot_entry = e
+      elif kind == entry_kind_other_pxe_boot:
+         other_pxe_boot_entries.append(e)
+      elif kind == entry_kind_first_optical_drive:
+         first_optical_drive_entry = e
+      elif kind == entry_kind_other_optical_drive:
+         other_optical_drive_entries.append(e)
+      elif kind == entry_kind_generic_usb:
+         other_entries.append(e)
+      elif kind == entry_kind_uefi_os:
+         uefi_os_entries.append(e)
+      else:
+         emsg("[%s] Script logic error: Unrecognized entry-kind %s" % (machine, kind))
+         all_entries_recognized = False
+   #
+   if not all_entries_recognized:
+      return None
+
+   # Now reorganizae info (all disabled except as noted):
+   # - First disk (enabled)
+   # - FIrst PXE Boot entries
+   # - First optical drive
+   # - Other disks
+   # - Other PXE boot entries
+   # - Other optilca drive entries
+   # - Other recognized device entries
+   # - UEFI OS book entries
+
+   new_boot_seq = []
+   all_required_entries_found = True
+
+   if first_disk_entry:
+      new_e = first_disk_entry
+      new_e["BootOptionEnabled"] = True
+      new_boot_seq.append(new_e)
+   else:
+      emsg("[%s] Current boot sequence did not contain a first-disk entry." % machine)
+      all_required_entries_found = False
+
+   if first_pxe_boot_entry:
+      new_e = first_pxe_boot_entry
+      new_e["BootOptionEnabled"] = False
+      new_boot_seq.append(new_e)
+   else:
+      emsg("[%s] Current boot sequence did not contain a first-PXE-boot entry." % machine)
+      all_required_entries_found = False
+
+   if first_optical_drive_entry:
+      new_e = first_optical_drive_entry
+      new_e["BootOptionEnabled"] = False
+      new_boot_seq.append(new_e)
+
+   list_of_lists =[other_disk_entries, other_pxe_boot_entries, other_optical_drive_entries,
+                   other_entries, uefi_os_entries]
+
+   for l in list_of_lists:
+      for e in l:
+         new_e = e
+         new_e["BootOptionEnabled"] = False
+         new_boot_seq.append(new_e)
+   #
+
+   if not all_required_entries_found:
+      return None
+   if len(input_boot_seq) != len(new_boot_seq):
+      emsg("[%s] Script logic error: Current and new boot sequences are not the same length." % machine)
+      return None
+
+   return new_boot_seq
+
+def get_current_dell_uefi_boot_sequence(machine, bmc_conn):
+
+   sys_res = bmc_conn.get_system_resource()
+   boot_sources = bmc_conn.get_resource(sys_res["@odata.id"] + "/BootSources")
+
+   # Example of interesting part of BootSources:
+
+   # ...
+   # "Attributes": {
+   #   "UefiBootSeq": [
+   #     {
+   #       "Enabled": true,
+   #       "Id": "BIOS.Setup.1-1#UefiBootSeq#RAID.Integrated.1-1#f1a60a11cf4311ecfd5309e802b3afc2",
+   #       "Index": 0,
+   #       "Name": "RAID.Integrated.1-1"
+   #     },
+   #     {
+   #       "Enabled": false,
+   #       "Id": "BIOS.Setup.1-1#UefiBootSeq#NIC.PxeDevice.1-1#f7dbc53a281f0f61e8e4c4fb27008828",
+   #       "Index": 1,
+   #       "Name": "NIC.PxeDevice.1-1"
+   #     },
+   #     ...
+   #     {
+   #       "Enabled": false,
+   #       "Id": "BIOS.Setup.1-1#UefiBootSeq#Unknown.Unknown.8-1#8541c05cfae70f8aec3fd50781b290e7",
+   #       "Index": 7,
+   #       "Name": "Unknown.Unknown.8-1"
+   #     }
+   #   ]
+   # }
+   # ...
+
+   return boot_sources["Attributes"]["UefiBootSeq"]
+
+def get_dell_uefi_boot_entry_name_to_id_map(machine, bmc_conn):
+
+   # Get the BootSourceRegistry attriute, and transform into a map from dos[;au ma,e
+   # to id.  We need this to translate the info in our rearranged boot sequence, which
+   # is expressed in terms of Redfish-standard BootOptions, into the corresponding
+   # Dell-specific UefiBootSeq info that we PATCH.  Correlating by display name seems
+   # like the only way to do it (eek!).
+
+   sys_res = bmc_conn.get_system_resource()
+   boot_sources_rgy = bmc_conn.get_resource(sys_res["@odata.id"] + "/BootSources/BootSourcesRegistry")
+
+   # Example of interesting part of BootSourcesRegistry
+
+   # ...
+   # "RegistryEntries": {
+   #   "Attributes": [
+   #     {
+   #       "AttributeName": "UefiBootSeq",
+   #       "DisplayName": "UEFI Boot Sequence",
+   #       "DisplayOrder": 0,
+   #       "Entry": [
+   #         {
+   #           "DisplayName": "Integrated RAID Controller 1: EFI RAID Disk PlaceHolder 1",
+   #           "Enabled": null,
+   #           "Id": "BIOS.Setup.1-1#UefiBootSeq#RAID.Integrated.1-1#f1a60a11cf4311ecfd5309e802b3afc2",
+   #           "Index": null,
+   #           "Name": "RAID.Integrated.1-1"
+   #         },
+   #         {
+   #           "DisplayName": "PXE Device 1: Embedded NIC 1 Port 1 Partition 1",
+   #           "Enabled": null,
+   #           "Id": "BIOS.Setup.1-1#UefiBootSeq#NIC.PxeDevice.1-1#f7dbc53a281f0f61e8e4c4fb27008828",
+   #           "Index": null,
+   #           "Name": "NIC.PxeDevice.1-1"
+   #         },
+   #         ...
+   #         {
+   #           "DisplayName": "Unavailable: ironic1",
+   #           "Enabled": null,
+   #           "Id": "BIOS.Setup.1-1#UefiBootSeq#Unknown.Unknown.8-1#8541c05cfae70f8aec3fd50781b290e7",
+   #           "Index": null,
+   #           "Name": "Unknown.Unknown.8-1"
+   #         }
+   #       ],
+   #       "HelpText": "This field controls the UEFI boot order. The first option in the list will be attempted first, and if unsuccessful, the second option will be attempted and so on. This field applies only when Boot Mode is 'UEFI'; it has no effect when Boot Mode is 'BIOS'.",
+   #       "Hidden": false,
+   #       "MenuPath": "./BootSettingsRef/UefiBootSettingsRef",
+   #       "ReadOnly": false,
+   #       "Type": "OrderedList"
+   #     }
+   #   ],
+   #   ...
+
+   # Find the UEFI Boot Sequence info within the attribute list.
+
+   uefi_boot_seq_attr = None
+   for e in boot_sources_rgy["RegistryEntries"]["Attributes"]:
+      if e["AttributeName"] == "UefiBootSeq":
+         uefi_boot_seq_attr = e
+         break
+   if uefi_boot_seq_attr == None:
+      die("Could not find UefiBootSeq attribute within BootSourcesRegistry resource.")
+
+   # Now turn the UEFI boot sequence info into the map we need.
+
+   disp_name_to_id_map = dict()
+   for e in uefi_boot_seq_attr["Entry"]:
+      ident = e["Id"]
+      name = e["Name"]
+      display_name = e["DisplayName"]
+      disp_name_to_id_map[display_name] = ident
+
+   return disp_name_to_id_map
+
+
+class ResetBootSequenceTask(DellSpecificTask):
+
+   def __init__(self, machine, bmc_conn, task_arg):
+      super(ResetBootSequenceTask, self).__init__(machine, bmc_conn)
+
+      self.abandon = False
+
+   @classmethod
+   def get_short_task_name(self):
+      return "bios-config"
+
+   def pre_check(self):
+      if not super(ResetBootSequenceTask, self).pre_check():
+         return False
+
+      bmc_conn = self.bmc_conn
+      machine = self.machine
+
+      bmc_conn.connection.dbg_msg_lvl_rf_write_requests = 1
+
+      system_res = bmc_conn.get_system_resource()
+
+      # Verify that the machine is in UEFI boot mode.
+
+      bios_res_id = system_res["Bios"]["@odata.id"]
+      bios_res = bmc_conn.get_resource(bios_res_id)
+      boot_mode = bios_res["Attributes"]["BootMode"]
+
+      if boot_mode != "Uefi":
+         emsg("[%s] Machine is not configured to use UEFI boot mode." % machine)
+         return False
+
+      # The current boot sequence is defined by the BootOrder property, which is a list
+      # of references to BootOptions from that BootOptions collection.  Get this data and
+      # rearrange into an easier-to-use form.  Hang on to the resutl in task state for
+      # later use too.
+
+      boot_props = system_res["Boot"]
+      boot_opts_coll_id = boot_props["BootOptions"]["@odata.id"]
+      boot_order = boot_props["BootOrder"]
+      boot_options_coll = bmc_conn.get_collection(boot_opts_coll_id, expand=1)
+      boot_opts_info = boot_options_coll["Members"]
+
+      boot_opts = {e["Id"] : e for e in boot_opts_info}
+      current_boot_seq = [boot_opts[i] for i in boot_order]
+      self.current_boot_seq = current_boot_seq
+
+      dbg("[%s] Current boot sequence:" % machine)
+      show_boot_sequence(machine, current_boot_seq)
+
+      ok = classify_dell_boot_entries(machine, current_boot_seq)
+      if not ok:
+         return False
+
+      self.task_target = None # Figure this out later
+      return True
+
+   def prepare_task_request(self):
+
+      # Approach:
+      # - Get the current boot sequence in Redfish-standard format (done in pre_check)
+      # - Rearrange that to the desired order.
+      # - Get the current boot sequence in Dell-specific form.
+      # - Develop mapings that can correlate between Redfish-standard and Dell boot entry ids.
+      # - Produce new Dell-specific boot sequence using above inputs.
+      # - Prepare and execute PATCH to make new configuration pending.
+      # - Prepare bios-config task target/body for the Runner framework to coordinate.
+
+      bmc_conn = self.bmc_conn
+      machine  = self.machine
+      current_boot_seq = self.current_boot_seq
+
+      new_boot_seq = rearrange_boot_sequence(machine, current_boot_seq)
+      if new_boot_seq is None:
+         return False
+
+      dbg("[%s] New boot sequence:" % machine)
+      show_boot_sequence(machine, new_boot_seq)
+
+      # Get current Dell boot sequence and index it by Id so that we can use it
+      # as source info to build the rearranged Dell boot sequence list.
+
+      current_dell_boot_seq = get_current_dell_uefi_boot_sequence(machine, self.bmc_conn)
+      id_to_entry = { e["Id"] : e for e in current_dell_boot_seq}
+
+      # Get map of display names to Dell boot-entry ids and vice versa to use for corelation.
+      disp_name_to_id = get_dell_uefi_boot_entry_name_to_id_map(machine, self.bmc_conn)
+      id_to_disp_name = {v: k for k, v in disp_name_to_id.items()}
+
+      # Build new boot sequence info based on the Redfish-based one we have
+      # computed, using the entries in the current Dell boot sequence as source
+      # and the display_name to id map as the correlatioin data.
+
+      new_dell_boot_seq = []
+      ix = 0
+      for e in new_boot_seq:
+         dell_entry = id_to_entry[disp_name_to_id[e["DisplayName"]]]
+         dell_entry["Enabled"] = e["BootOptionEnabled"]
+         dell_entry["Index"] = ix
+         new_dell_boot_seq.append(dell_entry)
+         ix += 1
+      #
+
+      dbg("[%s] New Dell boot sequence:" % machine)
+      show_dell_boot_sequence(machine, new_dell_boot_seq, id_to_disp_name, True)
+
+      sys_res = bmc_conn.get_system_resource()
+      boot_sources_settings_id = sys_res["@odata.id"] + "/BootSources/Settings"
+      boot_sources_settings = bmc_conn.get_resource(boot_sources_settings_id)
+
+      patch_body = {
+         "Attributes": {
+            "UefiBootSeq": new_dell_boot_seq
+         }
+      }
+
+      # dbg("PATCH body:\n%s" % json_dumps(patch_body))
+
+      bmc_conn.update_resource_by_id(boot_sources_settings_id, patch_body)
+
+      return False
+
+   def get_task_body(self):
+
+      body = dict()
+      return body
+
+   # Pre-submit, post-submit and post-completion handles that power the machine
+   # machine off before submit, then power it on after submit to allow the task
+   # to run, and then finallly power the machine offf again when done.
+
+   @classmethod
+   def announce_pre_submit_pass(self):
+      blurt("Powering the machines off.")
+
+   def pre_submit(self):
+      return self.do_power_action("Off")
+
+   @classmethod
+   def announce_post_submit_pass(self):
+      blurt("Powering the machines on.")
+
+   def post_submit(self):
+      return self.do_power_action("On")
+
+   @classmethod
+   def announce_post_completion_pass(self):
+      blurt("Powering all machines off.")
+      return
+
+   def post_completion(self):
+      return self.do_power_action("Off")
+
+   def get_task_target(self):
+      # Task target found/set during pre_check() or pre_launch()
+      return self.task_target
+
+
+def main():
+
+   set_dbg_volume_level(1)
+
+   parser = argparse.ArgumentParser()
+   parser.add_argument("machines", nargs="+")
+   LabBMCConnection.add_bmc_login_argument_definitions(parser)
+
+   args     = parser.parse_args()
+   machines = args.machines
+
+   runner = TaskRunner(machines, args, ResetBootSequenceTask, None)
+   runner.run()
+
+   exit(0)
+
+if __name__ == "__main__":
+   try:
+      main()
+   except BMCRequestError as exc:
+      die(str(exc))
+   except Exception:
+      traceback.print_exc()
+      die("Unhandled exception!")
+
